@@ -1,0 +1,221 @@
+{
+  "name": "Trip Snapshot Generator",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "trip-snapshot",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [240, 300],
+      "webhookId": "trip-snapshot"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Inputs from Webhook: origin, destination, start, days?\nconst q = $input.item.json.query || $input.item.json;\nif (!q.origin || !q.destination) {\n  throw new Error('Missing origin or destination. Example: ?origin=Lisbon&destination=Porto&start=2025-10-20&days=5');\n}\nconst start = q.start || new Date().toISOString().slice(0,10);\nconst days = Math.max(1, Math.min(parseInt(q.days || '5', 10), 10));\n\n// Compute end date\nconst d = new Date(start);\nd.setDate(d.getDate() + days - 1);\nconst end = d.toISOString().slice(0,10);\n\nreturn { origin: q.origin, destination: q.destination, start, days, end };"
+      },
+      "id": "validate-defaults",
+      "name": "Validate & Defaults",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://nominatim.openstreetmap.org/search?format=json&q={{ $json.origin }}&limit=1&addressdetails=0",
+        "options": {}
+      },
+      "id": "geocode-origin",
+      "name": "Geocode Origin",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 200]
+    },
+    {
+      "parameters": {
+        "url": "=https://nominatim.openstreetmap.org/search?format=json&q={{ $json.destination }}&limit=1&addressdetails=0",
+        "options": {}
+      },
+      "id": "geocode-destination",
+      "name": "Geocode Destination",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 400]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition"
+      },
+      "id": "merge-geocodes",
+      "name": "Merge Geocodes",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [840, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst originRes = items[0].json;\nconst destRes = items[1].json;\n\nif (!originRes[0] || !destRes[0]) throw new Error('Could not geocode one of the locations.');\n\nconst origLat = parseFloat(originRes[0].lat);\nconst origLon = parseFloat(originRes[0].lon);\nconst destLat = parseFloat(destRes[0].lat);\nconst destLon = parseFloat(destRes[0].lon);\n\nreturn { ...(items[0].json), origLat, origLon, destLat, destLon };"
+      },
+      "id": "pick-coords",
+      "name": "Pick Coords",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1040, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://router.project-osrm.org/route/v1/driving/{{ $json.origLon }},{{ $json.origLat }};{{ $json.destLon }},{{ $json.destLat }}?overview=full&geometries=geojson",
+        "options": {}
+      },
+      "id": "get-route",
+      "name": "Get Route (OSRM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1240, 200]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.open-meteo.com/v1/forecast?latitude={{ $json.destLat }}&longitude={{ $json.destLon }}&hourly=temperature_2m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&start_date={{ $json.start }}&end_date={{ $json.end }}",
+        "options": {}
+      },
+      "id": "get-weather",
+      "name": "Get Weather",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1240, 400]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "mergeByPosition"
+      },
+      "id": "merge-route-weather",
+      "name": "Merge Route & Weather",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1440, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst routeData = items[0].json;\nconst weatherData = items[1].json;\n\nconst km = Math.round(routeData.routes[0].distance / 1000);\nconst hrs = (routeData.routes[0].duration / 3600).toFixed(1);\n\nconst litersPer100km = 10;\nconst fuelPrice = 1.85;\nconst liters = km * (litersPer100km / 100);\nconst fuelCost = Math.round(liters * fuelPrice);\n\nconst daily = weatherData.daily;\nconst labels = daily.time;\nconst maxes = daily.temperature_2m_max;\nconst mins = daily.temperature_2m_min;\nconst precip = daily.precipitation_probability_max;\n\nconst chartCfg = {\n  type: 'line',\n  data: {\n    labels,\n    datasets: [\n      { label: 'Max °C', data: maxes, fill: false, borderColor: 'rgb(255, 99, 132)' },\n      { label: 'Min °C', data: mins, fill: false, borderColor: 'rgb(54, 162, 235)' }\n    ]\n  },\n  options: {\n    plugins: { legend: { display: true } },\n    scales: { y: { title: { display: true, text: '°C' } } }\n  }\n};\n\nconst chartUrl = 'https://quickchart.io/chart?c=' + encodeURIComponent(JSON.stringify(chartCfg));\n\nreturn {\n  ...(items[0].json),\n  weather: weatherData,\n  km, hrs, fuelCost, chartUrl, labels, maxes, mins, precip\n};"
+      },
+      "id": "chart-metrics",
+      "name": "Chart Data & Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1640, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const coords = $json.routes[0].geometry.coordinates;\nconst leafletCoords = coords.map(([lon, lat]) => [lat, lon]);\n\nconst mid = leafletCoords[Math.floor(leafletCoords.length / 2)];\nconst polylineCoords = JSON.stringify(leafletCoords);\n\nreturn { ...$json, leaflet: { center: mid, polylineCoords } };"
+      },
+      "id": "leaflet-prep",
+      "name": "Leaflet Polyline Prep",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1840, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const html = `<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\" />\n<title>Trip Snapshot — ${$json.origin} → ${$json.destination}</title>\n<link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\" />\n<style>\n  body{font-family:Inter,system-ui,Arial,sans-serif;margin:0;background:#0b1020;color:#e9eef7}\n  .wrap{max-width:1080px;margin:0 auto;padding:24px}\n  .header{display:flex;gap:12px;align-items:center;margin-bottom:16px}\n  .pill{background:#121a35;border:1px solid #1f2a52;padding:6px 10px;border-radius:999px;font-size:12px}\n  h1{font-size:28px;margin:0 0 12px}\n  .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:16px 0 20px}\n  .card{background:#0f1730;border:1px solid #1b2650;padding:16px;border-radius:16px}\n  .card h3{margin:0 0 8px;font-size:13px;color:#a7b3d1;text-transform:uppercase;letter-spacing:.06em}\n  .card .big{font-size:24px;font-weight:700}\n  #map{height:360px;border-radius:16px;border:1px solid #1b2650;margin:12px 0 20px}\n  .grid{display:grid;grid-template-columns:1.2fr .8fr;gap:16px}\n  img.chart{width:100%;border-radius:16px;border:1px solid #1b2650;background:#0f1730}\n  ul{margin:8px 0 0 16px}\n  li{margin:6px 0}\n  a{color:#9ac3ff;text-decoration:none}\n  footer{opacity:.6;font-size:12px;margin-top:16px}\n</style>\n</head>\n<body>\n  <div class=\"wrap\">\n    <div class=\"header\">\n      <span class=\"pill\">Trip Snapshot (demo)</span>\n      <span class=\"pill\">n8n → OSM • OSRM • Open-Meteo • QuickChart</span>\n    </div>\n    <h1>${$json.origin} → ${$json.destination}</h1>\n\n    <div id=\"map\"></div>\n\n    <div class=\"kpis\">\n      <div class=\"card\"><h3>Distance</h3><div class=\"big\">${$json.km} km</div></div>\n      <div class=\"card\"><h3>Drive Time</h3><div class=\"big\">${$json.hrs} h</div></div>\n      <div class=\"card\"><h3>Est. Fuel</h3><div class=\"big\">€${$json.fuelCost}</div></div>\n    </div>\n\n    <div class=\"grid\">\n      <div>\n        <div class=\"card\">\n          <h3>Temperature Outlook</h3>\n          <img class=\"chart\" src=\"${$json.chartUrl}\" alt=\"Temperature chart\" />\n          <p style=\"margin-top:10px;opacity:.8\">Dates: ${$json.labels.join(', ')}</p>\n        </div>\n      </div>\n      <div>\n        <div class=\"card\">\n          <h3>Forecast Highlights</h3>\n          <ul>\n          ${$json.labels.map((d,i)=>`<li><strong>${d}:</strong> ${$json.mins[i]}–${$json.maxes[i]} °C, precip ${$json.precip[i] ?? 0}%</li>`).join('')}\n          </ul>\n        </div>\n        <div class=\"card\">\n          <h3>Notes</h3>\n          <p>Fuel calc assumes 10L/100km at €1.85/L. Adjust in workflow for your fleet.</p>\n          <p>Tip: Swap destination lat/lon to pickup depot to brief drivers in real time.</p>\n        </div>\n      </div>\n    </div>\n\n    <footer>Built with n8n • Data: OpenStreetMap/Nominatim, OSRM, Open-Meteo, QuickChart • This is a non-production demo.</footer>\n  </div>\n\n<script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>\n<script>\nconst center = ${$json.leaflet.center};\nconst coords = ${$json.leaflet.polylineCoords};\nconst map = L.map('map',{ zoomControl:true, scrollWheelZoom:false }).setView(center, 7);\nL.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {\n  attribution:'&copy; OpenStreetMap'\n}).addTo(map);\nconst route = L.polyline(coords, {weight:4, opacity:0.9, color:'#4A90E2'}).addTo(map);\nL.marker(coords[0]).addTo(map).bindPopup('${$json.origin}');\nL.marker(coords[coords.length-1]).addTo(map).bindPopup('${$json.destination}');\nmap.fitBounds(route.getBounds(), {padding:[20,20]});\n</script>\n</body>\n</html>`;\n\nreturn { ...$json, html };"
+      },
+      "id": "set-payload",
+      "name": "Set Presentation Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2040, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      },
+      "id": "html-response",
+      "name": "HTML Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2240, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{"node": "Validate & Defaults", "type": "main", "index": 0}]]
+    },
+    "Validate & Defaults": {
+      "main": [[
+        {"node": "Geocode Origin", "type": "main", "index": 0},
+        {"node": "Geocode Destination", "type": "main", "index": 0}
+      ]]
+    },
+    "Geocode Origin": {
+      "main": [[{"node": "Merge Geocodes", "type": "main", "index": 0}]]
+    },
+    "Geocode Destination": {
+      "main": [[{"node": "Merge Geocodes", "type": "main", "index": 1}]]
+    },
+    "Merge Geocodes": {
+      "main": [[{"node": "Pick Coords", "type": "main", "index": 0}]]
+    },
+    "Pick Coords": {
+      "main": [[
+        {"node": "Get Route (OSRM)", "type": "main", "index": 0},
+        {"node": "Get Weather", "type": "main", "index": 0}
+      ]]
+    },
+    "Get Route (OSRM)": {
+      "main": [[{"node": "Merge Route & Weather", "type": "main", "index": 0}]]
+    },
+    "Get Weather": {
+      "main": [[{"node": "Merge Route & Weather", "type": "main", "index": 1}]]
+    },
+    "Merge Route & Weather": {
+      "main": [[{"node": "Chart Data & Metrics", "type": "main", "index": 0}]]
+    },
+    "Chart Data & Metrics": {
+      "main": [[{"node": "Leaflet Polyline Prep", "type": "main", "index": 0}]]
+    },
+    "Leaflet Polyline Prep": {
+      "main": [[{"node": "Set Presentation Payload", "type": "main", "index": 0}]]
+    },
+    "Set Presentation Payload": {
+      "main": [[{"node": "HTML Response", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "createdAt": "2025-10-20T06:00:00.000Z",
+      "updatedAt": "2025-10-20T06:00:00.000Z",
+      "id": "1",
+      "name": "demo"
+    },
+    {
+      "createdAt": "2025-10-20T06:00:00.000Z",
+      "updatedAt": "2025-10-20T06:00:00.000Z",
+      "id": "2",
+      "name": "logistics"
+    }
+  ],
+  "triggerCount": 0,
+  "updatedAt": "2025-10-20T06:00:00.000Z",
+  "versionId": "1"
+}
